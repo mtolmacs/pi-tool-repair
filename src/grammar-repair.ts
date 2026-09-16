@@ -27,6 +27,9 @@ export interface GrammarRepairConfig {
   // Case-insensitive regex fragments that auto-enable grammar repair when the
   // active model id matches one of them. Ignored while `enabled` is true.
   leakModels?: string[];
+  // Extra leaked-tool-name -> canonical-tool-name aliases, merged over the
+  // built-in `TOOL_NAME_ALIASES`. Keys are matched case-insensitively.
+  toolNameAliases?: Record<string, string>;
 }
 
 export interface ExtensionFileConfig {
@@ -42,6 +45,7 @@ export interface RecoveredToolCall {
 interface Candidate extends RecoveredToolCall {
   range: Range;
   stripOnly?: boolean;
+  body?: string;
 }
 
 interface Range {
@@ -88,6 +92,21 @@ export interface GrammarRepairResult {
 
 const ALL_GRAMMARS = [...GRAMMAR_NAMES];
 
+export const TOOL_NAME_ALIASES: Record<string, string> = {
+  command: "bash",
+  shell: "bash",
+  execute: "bash",
+  execute_command: "bash",
+  run_command: "bash",
+  run_shell: "bash",
+  bash_command: "bash",
+  terminal: "bash",
+};
+
+// Argument keys a leaked shell call may use for the command string.
+const COMMAND_ARGUMENT_KEYS = ["command", "cmd", "shell_command", "script", "input"] as const;
+const COMMAND_ARGUMENT_KEY = COMMAND_ARGUMENT_KEYS[0];
+
 export const DEFAULT_GRAMMAR_REPAIR_CONFIG: GrammarRepairConfig = {
   enabled: false,
   grammars: ALL_GRAMMARS,
@@ -123,6 +142,7 @@ export function normalizeGrammarRepairConfig(raw: Partial<GrammarRepairConfig> =
     : ALL_GRAMMARS;
 
   const leakModels = normalizeLeakModels(raw.leakModels);
+  const toolNameAliases = normalizeToolNameAliases(raw.toolNameAliases);
 
   return {
     enabled: raw.enabled ?? DEFAULT_GRAMMAR_REPAIR_CONFIG.enabled,
@@ -131,6 +151,7 @@ export function normalizeGrammarRepairConfig(raw: Partial<GrammarRepairConfig> =
     requireKnownTool: raw.requireKnownTool ?? DEFAULT_GRAMMAR_REPAIR_CONFIG.requireKnownTool,
     debug: raw.debug ?? DEFAULT_GRAMMAR_REPAIR_CONFIG.debug,
     ...(leakModels ? { leakModels } : {}),
+    ...(toolNameAliases ? { toolNameAliases } : {}),
   };
 }
 
@@ -149,6 +170,16 @@ function normalizeLeakModels(raw: unknown): string[] | undefined {
       typeof pattern === "string" && compileLeakModelPattern(pattern) !== undefined,
   );
   return valid.length > 0 ? valid : undefined;
+}
+
+function normalizeToolNameAliases(raw: unknown): Record<string, string> | undefined {
+  if (!isObject(raw)) return undefined;
+  const aliases: Record<string, string> = {};
+  for (const [from, to] of Object.entries(raw)) {
+    if (typeof to !== "string" || !from.trim() || !to.trim()) continue;
+    aliases[from.trim().toLowerCase()] = to.trim();
+  }
+  return Object.keys(aliases).length > 0 ? aliases : undefined;
 }
 
 // Enables grammar repair for the current message when the active model id
@@ -187,8 +218,9 @@ export function repairAssistantMessageGrammarLeaks(
     const text = getPartText(part);
     if (text === undefined) return part;
 
-    const candidates = selectCandidates(parseToolGrammarCandidates(text, enabled))
-      .filter((candidate) => candidate.stripOnly || isAllowedTool(candidate.name, config, knownTools));
+    const candidates = selectCandidates(parseToolGrammarCandidates(text, enabled)).map((candidate) =>
+      candidate.stripOnly ? candidate : normalizeCandidate(candidate, config, knownTools),
+    );
 
     if (candidates.length === 0) return part;
 
@@ -206,6 +238,16 @@ export function repairAssistantMessageGrammarLeaks(
           process.stderr.write(
             `[pi-tool-repair] grammar-repair skipping ${candidate.grammar}:${candidate.name} ` +
             "(empty arguments, likely malformed grammar)\n",
+          );
+        }
+        continue;
+      }
+
+      if (!isAllowedTool(candidate.name, config, knownTools)) {
+        if (config.debug) {
+          process.stderr.write(
+            `[pi-tool-repair] grammar-repair stripping unknown ${candidate.grammar}:${candidate.name} ` +
+            "(not an active tool, no alias)\n",
           );
         }
         continue;
@@ -369,7 +411,7 @@ function parseDsmlInvokes(body: string): Array<Omit<Candidate, "range" | "gramma
     const close = findPattern(body, new RegExp(`</${prefix}invoke>`, "iu"), invokeBodyStart);
     if (!close) continue;
     const invokeBody = body.slice(invokeBodyStart, close.start);
-    calls.push({ name, arguments: parseDsmlArguments(invokeBody) });
+    calls.push({ name, arguments: parseDsmlArguments(invokeBody), body: invokeBody });
   }
 
   return calls;
@@ -904,6 +946,39 @@ function rangesOverlap(a: Range, b: Range): boolean {
 function isAllowedTool(candidateName: string, config: GrammarRepairConfig, knownTools: Set<string>): boolean {
   if (!config.requireKnownTool) return true;
   return knownTools.size > 0 && knownTools.has(candidateName);
+}
+
+function resolveToolNameAlias(
+  name: string,
+  config: GrammarRepairConfig,
+  knownTools: Set<string>,
+): string | undefined {
+  const key = name.trim().toLowerCase();
+  const candidate = config.toolNameAliases?.[key] ?? TOOL_NAME_ALIASES[key];
+  if (!candidate) return undefined;
+  return knownTools.has(candidate) ? candidate : undefined;
+}
+
+function normalizeCandidate(
+  candidate: Candidate,
+  config: GrammarRepairConfig,
+  knownTools: Set<string>,
+): Candidate {
+  const alias = resolveToolNameAlias(candidate.name, config, knownTools);
+  if (!alias) return candidate;
+
+  const args = candidate.arguments;
+  if (args[COMMAND_ARGUMENT_KEY] !== undefined) {
+    return { ...candidate, name: alias, arguments: { command: args[COMMAND_ARGUMENT_KEY] } };
+  }
+
+  const keyed = COMMAND_ARGUMENT_KEYS.find((key) => args[key] !== undefined);
+  if (keyed) return { ...candidate, name: alias, arguments: { command: args[keyed] } };
+
+  const body = candidate.body?.trim();
+  if (body) return { ...candidate, name: alias, arguments: { command: body } };
+
+  return { ...candidate, name: alias };
 }
 
 function removeRanges(text: string, ranges: Range[]): string {

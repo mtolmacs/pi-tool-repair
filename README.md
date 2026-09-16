@@ -21,19 +21,19 @@ Reverse-engineered from [Command Code](https://commandcode.ai/)'s tool parsing p
 
 ## What it fixes
 
-| Problem | Model sends | After repair |
-| ------- | ----------- | ------------ |
-| `null` for optional fields | `{"path":"/foo","offset":null}` | `{"path":"/foo"}` |
-| Arrays as JSON strings | `{"edits":"[{...}]"}` | `{"edits":[{...}]}` |
-| `{}` where an optional array is expected | `{"include":{}}` | _(dropped)_ |
-| Bare string where an array is expected | `{"include":"foo"}` | `{"include":["foo"]}` |
-| Wrong field names | `{"file_path":"/foo"}` | `{"path":"/foo"}` |
-| Numeric strings | `{"limit":"20"}` | `{"limit":20}` |
-| Bare string as root input | `"/path/to/file"` | `{"path":"/path/to/file"}` |
-| `fabric_exec` code arrays | `{"code":["const x=1;","return x;"]}` | newline-joined `code` |
-| Schema anchor bleed (Kimi K2) | `"^pattern$"` in values | `"pattern"` |
-| Leaked tool grammar (opt-in) | `<｜DSML｜tool_calls>...` | pi `toolCall` block |
-| Phantom tool use | `stopReason:"toolUse"` with no call | retryable error |
+| Problem                                  | Model sends                           | After repair               |
+| ---------------------------------------- | ------------------------------------- | -------------------------- |
+| `null` for optional fields               | `{"path":"/foo","offset":null}`       | `{"path":"/foo"}`          |
+| Arrays as JSON strings                   | `{"edits":"[{...}]"}`                 | `{"edits":[{...}]}`        |
+| `{}` where an optional array is expected | `{"include":{}}`                      | _(dropped)_                |
+| Bare string where an array is expected   | `{"include":"foo"}`                   | `{"include":["foo"]}`      |
+| Wrong field names                        | `{"file_path":"/foo"}`                | `{"path":"/foo"}`          |
+| Numeric strings                          | `{"limit":"20"}`                      | `{"limit":20}`             |
+| Bare string as root input                | `"/path/to/file"`                     | `{"path":"/path/to/file"}` |
+| `fabric_exec` code arrays                | `{"code":["const x=1;","return x;"]}` | newline-joined `code`      |
+| Schema anchor bleed (Kimi K2)            | `"^pattern$"` in values               | `"pattern"`                |
+| Leaked tool grammar (opt-in)             | `<｜DSML｜tool_calls>...`             | pi `toolCall` block        |
+| Phantom tool use                         | `stopReason:"toolUse"` with no call   | retryable error            |
 
 ## Install
 
@@ -94,17 +94,17 @@ Pi 0.84 validates tool arguments before emitting `tool_call`. Repair therefore r
 
 ### Repair rules
 
-| Rule | What it catches |
-| ---- | --------------- |
-| `renameAliasedField` | `file_path` → `path`, `query` → `pattern`, option aliases, etc. |
-| `dropNullOrUndefined` | `null`/`undefined` for schema-optional fields |
-| `dropEmptyObjectPlaceholder` | `{}` where an optional array is expected |
-| `parseJsonStringifiedArray` | `"[\"a\",\"b\"]"` → `["a","b"]` |
-| `wrapBareStringAsArray` | `"foo"` → `["foo"]` when the schema expects an array |
-| `wrapRootStringAsObject` | `"/path"` → `{"path":"/path"}` for known string-primary tools |
-| `coerceNumericString` | `"20"` → `20` when the live schema expects a number |
-| `convertTimeoutMilliseconds` | `timeoutMs` → `timeout` seconds for `bash` |
-| `joinStringArray` | all-string `fabric_exec.code` arrays → one newline-joined string |
+| Rule                         | What it catches                                                  |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `renameAliasedField`         | `file_path` → `path`, `query` → `pattern`, option aliases, etc.  |
+| `dropNullOrUndefined`        | `null`/`undefined` for schema-optional fields                    |
+| `dropEmptyObjectPlaceholder` | `{}` where an optional array is expected                         |
+| `parseJsonStringifiedArray`  | `"[\"a\",\"b\"]"` → `["a","b"]`                                  |
+| `wrapBareStringAsArray`      | `"foo"` → `["foo"]` when the schema expects an array             |
+| `wrapRootStringAsObject`     | `"/path"` → `{"path":"/path"}` for known string-primary tools    |
+| `coerceNumericString`        | `"20"` → `20` when the live schema expects a number              |
+| `convertTimeoutMilliseconds` | `timeoutMs` → `timeout` seconds for `bash`                       |
+| `joinStringArray`            | all-string `fabric_exec.code` arrays → one newline-joined string |
 
 ### Why validate-then-repair
 
@@ -159,6 +159,26 @@ If only some of your models leak grammar — common with local servers such as l
 
 Recovery turns on whenever the session's model id matches a pattern. Global `enabled: true` takes precedence over `leakModels`, so models with reliable native tool calling stay untouched. Regex entries that fail to compile are ignored.
 
+#### Tool-name aliases
+
+Open models often leak their own shell vocabulary instead of pi's canonical tool name. DeepSeek V4 Flash, for example, emits `<...invoke name="command">` within DSML where pi expects `bash`. Built-in aliases cover the common cases:
+
+| Leaked name                                                                                              | Resolves to |
+| -------------------------------------------------------------------------------------------------------- | ----------- |
+| `command`, `shell`, `execute`, `execute_command`, `run_command`, `run_shell`, `bash_command`, `terminal` | `bash`      |
+
+Aliases apply before the `requireKnownTool` check, so an aliased call resolves against your active tools rather than the leaked name. If the alias target is not active, the markup is stripped but the call is not recovered. Argument keys `command`, `cmd`, `shell_command`, `script`, and `input` are normalized to `command`; a bare invoke body (for example `<...invoke name="command">pwd</...invoke>`) becomes the `command` value.
+
+Extend or override the map with `toolNameAliases`. Keys are matched case-insensitively:
+
+```json
+{
+  "grammarRepair": {
+    "toolNameAliases": { "command": "bash", "exec": "bash" }
+  }
+}
+```
+
 #### What the model sees on the next request
 
 Every repair runs on pi's `message_end` hook, where the repaired message is replaced in place — the corrected call, not the model's original output, is what pi writes to the session file and resends on later requests. With `mode: "recover"`, leaked tool-call text is likewise converted into real `toolCall` blocks before persistence, so subsequent requests show the model a properly formed call plus its tool results: an in-context correction loop instead of a silent execute-time patch. Local models benefit the most since there is no prompt-cache penalty for the rewritten history; providers that cache by prefix may treat the first turn after a repair as a cache miss.
@@ -210,19 +230,19 @@ The extension maps common model mistakes (wrong field names) to the canonical fi
 <details>
 <summary><strong>Alias summary</strong></summary>
 
-| Tool | Canonical | Aliases |
-| ---- | --------- | ------- |
-| `read` | `path` | `absolutePath`, `file_path`, `filePath`, `filepath`, `pathname`, `target_file`, `targetFile`, `file`, `absolute_path`, `fileAbsolutePath` |
-| `read` | `offset`, `limit` | `start`, `max` |
-| `grep` | `pattern` | `query`, `regex`, `search`, `q`, `expression`, `text` |
-| `grep` | `glob`, `ignoreCase`, `context`, `limit` | `globPattern`, `ic`, `caseInsensitive`, `ctx`, `max` |
-| `write` | `path`, `content` | path aliases above; `text`, `body`, `data`, `contents`, `fileContent` |
-| `edit` | `path` | path aliases above |
-| `edit` | `oldText` | `old_string`, `oldString`, `old`, `old_str`, `oldStr`, `from`, `old_value`, `old_text`, `oldContent`, `old_content` |
-| `edit` | `newText` | `new_string`, `newString`, `new`, `replacement`, `new_str`, `newStr`, `to`, `new_value`, `new_text`, `newContent`, `new_content` |
-| `ls` | `path`, `limit` | path aliases plus `directory`, `dir`, `folder`, `directoryPath`; `max` |
-| `find` | `pattern`, `limit` | `query`, `regex`, `glob`, `expression`, `search`, `include`, `name`, `filename`; `max` |
-| `bash` | `command` | `cmd`, `shell`, `cmdline`, `script`, `commandLine` |
+| Tool    | Canonical                                | Aliases                                                                                                                                   |
+| ------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`  | `path`                                   | `absolutePath`, `file_path`, `filePath`, `filepath`, `pathname`, `target_file`, `targetFile`, `file`, `absolute_path`, `fileAbsolutePath` |
+| `read`  | `offset`, `limit`                        | `start`, `max`                                                                                                                            |
+| `grep`  | `pattern`                                | `query`, `regex`, `search`, `q`, `expression`, `text`                                                                                     |
+| `grep`  | `glob`, `ignoreCase`, `context`, `limit` | `globPattern`, `ic`, `caseInsensitive`, `ctx`, `max`                                                                                      |
+| `write` | `path`, `content`                        | path aliases above; `text`, `body`, `data`, `contents`, `fileContent`                                                                     |
+| `edit`  | `path`                                   | path aliases above                                                                                                                        |
+| `edit`  | `oldText`                                | `old_string`, `oldString`, `old`, `old_str`, `oldStr`, `from`, `old_value`, `old_text`, `oldContent`, `old_content`                       |
+| `edit`  | `newText`                                | `new_string`, `newString`, `new`, `replacement`, `new_str`, `newStr`, `to`, `new_value`, `new_text`, `newContent`, `new_content`          |
+| `ls`    | `path`, `limit`                          | path aliases plus `directory`, `dir`, `folder`, `directoryPath`; `max`                                                                    |
+| `find`  | `pattern`, `limit`                       | `query`, `regex`, `glob`, `expression`, `search`, `include`, `name`, `filename`; `max`                                                    |
+| `bash`  | `command`                                | `cmd`, `shell`, `cmdline`, `script`, `commandLine`                                                                                        |
 
 </details>
 

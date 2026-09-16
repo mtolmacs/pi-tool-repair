@@ -261,18 +261,20 @@ describe("assistant message grammar repair", () => {
     ]);
   });
 
-  it("requires known tools by default", () => {
+  it("does not recover unknown tools, but strips their leaked markers", () => {
     const message: MinimalAssistantMessage = {
       role: "assistant",
       content: [
-        { type: "text", text: `<tool_call>{"name":"unknown","arguments":{}}</tool_call>` },
+        { type: "text", text: `<tool_call>{"name":"unknown","arguments":{"path":"/foo"}}</tool_call>` },
       ],
       stopReason: "stop",
       timestamp: 1,
     };
 
     const result = repairAssistantMessageGrammarLeaks(message, enabledConfig, new Set(["bash"]));
-    expect(result.changed).toBe(false);
+    expect(result.recoveredCalls).toEqual([]);
+    expect(result.message.stopReason).toBe("stop");
+    expect((result.message.content[0] as { text: string }).text).not.toContain("tool_call");
   });
 
   it("does not recover a call with empty arguments", () => {
@@ -455,5 +457,74 @@ describe("per-model grammar repair enablement", () => {
     const result = repairAssistantMessageGrammarLeaks(leakedMessage(), resolved, new Set(["bash"]));
     expect(result.changed).toBe(false);
     expect(result.recoveredCalls).toHaveLength(0);
+  });
+});
+
+describe("DSML tool-name aliasing", () => {
+  const P = "｜｜DSML｜｜";
+  const dsml = (body: string) => `<${P}tool_calls>\n${body}\n</${P}tool_calls>`;
+  const dsmlMsg = (text: string): MinimalAssistantMessage => ({
+    role: "assistant",
+    content: [{ type: "text", text }],
+    stopReason: "stop",
+  });
+
+  it(`rewrites invoke name="command" with a command parameter to bash`, () => {
+    const text = dsml(`<${P}invoke name="command">\n<${P}parameter name="command" string="true">pwd</${P}parameter>\n</${P}invoke>`);
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash", "read"]));
+    expect(result.changed).toBe(true);
+    expect(result.recoveredCalls).toEqual([{ grammar: "dsml", name: "bash", arguments: { command: "pwd" } }]);
+    expect(result.message.stopReason).toBe("toolUse");
+    expect(result.message.content).toContainEqual(
+      expect.objectContaining({ type: "toolCall", name: "bash", arguments: { command: "pwd" } }),
+    );
+  });
+
+  it(`recovers the bare invoke body of name="command" as the command`, () => {
+    const text = dsml(`<${P}invoke name="command">pwd</${P}invoke>`);
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([{ grammar: "dsml", name: "bash", arguments: { command: "pwd" } }]);
+    expect(result.message.stopReason).toBe("toolUse");
+  });
+
+  it(`maps cmd/shell aliases onto bash with a command argument`, () => {
+    const cmdArg = dsml(`<${P}invoke name="command">\n<${P}parameter name="cmd" string="true">ls -la</${P}parameter>\n</${P}invoke>`);
+    expect(repairAssistantMessageGrammarLeaks(dsmlMsg(cmdArg), enabledConfig, new Set(["bash"])).recoveredCalls)
+      .toEqual([{ grammar: "dsml", name: "bash", arguments: { command: "ls -la" } }]);
+
+    const shell = dsml(`<${P}invoke name="shell">echo hi</${P}invoke>`);
+    expect(repairAssistantMessageGrammarLeaks(dsmlMsg(shell), enabledConfig, new Set(["bash"])).recoveredCalls)
+      .toEqual([{ grammar: "dsml", name: "bash", arguments: { command: "echo hi" } }]);
+  });
+
+  it(`leaves invoke name="bash" untouched`, () => {
+    const text = dsml(`<${P}invoke name="bash">\n<${P}parameter name="command" string="true">pwd</${P}parameter>\n</${P}invoke>`);
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([{ grammar: "dsml", name: "bash", arguments: { command: "pwd" } }]);
+  });
+
+  it(`strips the raw markers when the alias target is not active`, () => {
+    const text = dsml(`<${P}invoke name="command">pwd</${P}invoke>`);
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["read"]));
+    expect(result.recoveredCalls).toEqual([]);
+    expect(result.message.stopReason).toBe("stop");
+    expect((result.message.content[0] as { text: string }).text).not.toContain("DSML");
+  });
+
+  it(`strips an unaliased unknown tool leak without recovering it`, () => {
+    const text = dsml(`<${P}invoke name="totally_unknown">\n<${P}parameter name="x" string="true">1</${P}parameter>\n</${P}invoke>`);
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(`checking\n${text}`), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([]);
+    expect(result.message.stopReason).toBe("stop");
+    const stripped = (result.message.content[0] as { text: string }).text;
+    expect(stripped).not.toContain("DSML");
+    expect(stripped).toContain("checking");
+  });
+
+  it(`honors a configured toolNameAliases override`, () => {
+    const config: GrammarRepairConfig = { ...enabledConfig, toolNameAliases: { command: "read" } };
+    const text = dsml(`<${P}invoke name="command">\n<${P}parameter name="command" string="true">pwd</${P}parameter>\n</${P}invoke>`);
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), config, new Set(["bash", "read"]));
+    expect(result.recoveredCalls).toEqual([{ grammar: "dsml", name: "read", arguments: { command: "pwd" } }]);
   });
 });
