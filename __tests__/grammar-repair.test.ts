@@ -225,6 +225,67 @@ describe("DSML dangling marker stripping", () => {
   it("does not report orphan markers from a truncated body as recovered calls", () => {
     expect(parseToolGrammarLeaks("<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">", ["dsml"])).toEqual([]);
   });
+
+  it("parses spaced DSML markers (space between prefix and tag name)", () => {
+    const text = `Let me run the tests.
+
+<｜DSML｜ tool_calls>
+<｜DSML｜ invoke name="bash">
+<｜DSML｜ parameter name="command" string="true">cd /tmp && ls</｜DSML｜ parameter>
+<｜DSML｜ parameter name="timeout" string="false">600</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>`;
+
+    const calls = parseToolGrammarLeaks(text, ["dsml"]);
+    expect(calls).toEqual([
+      {
+        grammar: "dsml",
+        name: "bash",
+        arguments: { command: "cd /tmp && ls", timeout: 600 },
+      },
+    ]);
+  });
+
+  it("parses opener-less DSML fragment with mangled <parameter name=\"tool\"> opener", () => {
+    const text = `Let me check something.
+
+<parameter name="bash">
+<｜DSML｜ parameter name="command" string="true">cd /Users/mtolmacs/Projects/excalidraw && npx vitest run tests/bindingRepair.test.ts 2>&1 | head -40</｜DSML｜ parameter>
+<｜DSML｜ parameter name="timeout" string="false">600</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>`;
+
+    const calls = parseToolGrammarLeaks(text, ["dsml"]);
+    expect(calls).toEqual([
+      {
+        grammar: "dsml",
+        name: "bash",
+        arguments: {
+          command: "cd /Users/mtolmacs/Projects/excalidraw && npx vitest run tests/bindingRepair.test.ts 2>&1 | head -40",
+          timeout: 600,
+        },
+      },
+    ]);
+  });
+
+  it("strips leaked spaced DSML markers from an unrecoverable fragment", () => {
+    const message: MinimalAssistantMessage = {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: `Partial output.\n<｜DSML｜ parameter name="x">value</｜DSML｜ parameter>\n</｜DSML｜ invoke>`,
+        },
+      ],
+      stopReason: "stop",
+      timestamp: 1,
+    };
+
+    const result = repairAssistantMessageGrammarLeaks(message, enabledConfig, new Set(["bash"]));
+    expect(result.changed).toBe(true);
+    const text = (result.message.content[0] as { text: string }).text;
+    expect(text).not.toContain("DSML");
+  });
 });
 
 describe("assistant message grammar repair", () => {

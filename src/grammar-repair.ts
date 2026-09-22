@@ -313,6 +313,7 @@ function parseToolGrammarCandidates(text: string, enabled: Set<GrammarName>): Ca
   const candidates: Candidate[] = [];
   if (enabled.has("dsml")) {
     candidates.push(...parseDsml(text));
+    candidates.push(...parseDsmlOpenerless(text));
     candidates.push(...parseDsmlDanglingMarkers(text));
   }
   if (enabled.has("kimi")) candidates.push(...parseKimi(text));
@@ -334,16 +335,22 @@ function parseToolGrammarCandidates(text: string, enabled: Set<GrammarName>): Ca
   return candidates.filter((candidate) => candidate.range.end > candidate.range.start);
 }
 
+// Shared DSML prefix: matches ｜DSML｜, ｜｜DSML｜｜, DSML｜, | DSML |,
+// and DeepSeek V4.1's spaced form (<｜DSML｜ parameter>) via the trailing \s*.
+const DSML_PREFIX = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)\\s*";
+
 function parseDsml(text: string): Candidate[] {
   const candidates: Candidate[] = [];
-  const prefix = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)";
-  const outerOpen = new RegExp(`<${prefix}(?:tool_calls|function_calls)>`, "giu");
+  const outerOpen = new RegExp(`<${DSML_PREFIX}(?:tool_calls|function_calls|calls)>`, "giu");
 
   for (const match of text.matchAll(outerOpen)) {
     if (match.index === undefined || isInsideCodeFence(text, match.index)) continue;
     const start = match.index;
     const bodyStart = start + match[0].length;
-    const close = findDsmlClose(text, bodyStart, "tool_calls") ?? findDsmlClose(text, bodyStart, "function_calls");
+    const close =
+      findDsmlClose(text, bodyStart, "tool_calls") ??
+      findDsmlClose(text, bodyStart, "function_calls") ??
+      findDsmlClose(text, bodyStart, "calls");
     const end = close ? close.end : findBestUnclosedDsmlEnd(text, bodyStart);
     if (end === undefined) continue;
     const body = text.slice(bodyStart, close ? close.start : end);
@@ -356,11 +363,40 @@ function parseDsml(text: string): Candidate[] {
   return candidates;
 }
 
+// Opener-less DSML fragments: the outer tool_calls and invoke openers were
+// eaten by the provider, leaving a bare `<parameter name="tool">` followed
+// by DSML-prefixed parameter children. Recover when DSML markers follow,
+// otherwise skip (a plain <parameter> tag alone is not DSML).
+function parseDsmlOpenerless(text: string): Candidate[] {
+  const candidates: Candidate[] = [];
+  const openerRe = new RegExp(`<parameter\\s+name=["']([^"']+)["']\\s*>`, "giu");
+  const paramAheadRe = new RegExp(`<${DSML_PREFIX}parameter`, "iu");
+  const closeRe = new RegExp(`</${DSML_PREFIX}(?:invoke|calls)>`, "iu");
+
+  for (const match of text.matchAll(openerRe)) {
+    if (match.index === undefined || isInsideCodeFence(text, match.index)) continue;
+    const name = match[1]?.trim();
+    if (!name) continue;
+    const bodyStart = match.index + match[0].length;
+    if (!paramAheadRe.test(text.slice(bodyStart, bodyStart + 200))) continue;
+    const close = findPattern(text, closeRe, bodyStart);
+    if (!close) continue;
+    const body = text.slice(bodyStart, close.start);
+    candidates.push({
+      name,
+      arguments: parseDsmlArguments(body),
+      grammar: "dsml",
+      range: { start: match.index, end: close.end },
+    });
+  }
+
+  return candidates;
+}
+
 function parseDsmlDanglingMarkers(text: string): Candidate[] {
   if (!text.includes("DSML")) return [];
-  const prefix = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)";
   const markerRe = new RegExp(
-    `</?${prefix}(?:tool_calls|function_calls|invoke|parameter)(?:\\s+[^>\\n]*)?>?`,
+    `</?${DSML_PREFIX}(?:tool_calls|function_calls|invoke|parameter|calls)(?:\\s+[^>\\n]*)?>?`,
     "giu",
   );
   const candidates: Candidate[] = [];
@@ -379,15 +415,14 @@ function parseDsmlDanglingMarkers(text: string): Candidate[] {
 }
 
 function findDsmlClose(text: string, from: number, outerName: string): Range | undefined {
-  const prefix = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)";
-  const closeRe = new RegExp(`</${prefix}${outerName}>`, "giu");
+  const closeRe = new RegExp(`</${DSML_PREFIX}${outerName}>`, "giu");
   closeRe.lastIndex = from;
   const match = closeRe.exec(text);
   return match && match.index >= from ? { start: match.index, end: match.index + match[0].length } : undefined;
 }
 
 function findBestUnclosedDsmlEnd(text: string, from: number): number | undefined {
-  const invokeClose = /<\/(?:｜{1,2}DSML｜{1,2}|DSML｜|\s*\|\s*DSML\s*\|\s*)invoke>/giu;
+  const invokeClose = new RegExp(`</${DSML_PREFIX}invoke>`, "giu");
   invokeClose.lastIndex = from;
   let end: number | undefined;
   for (;;) {
@@ -400,15 +435,14 @@ function findBestUnclosedDsmlEnd(text: string, from: number): number | undefined
 
 function parseDsmlInvokes(body: string): Array<Omit<Candidate, "range" | "grammar">> {
   const calls: Array<Omit<Candidate, "range" | "grammar">> = [];
-  const prefix = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)";
-  const invokeRe = new RegExp(`<${prefix}invoke\\s+name=["']([^"']+)["']\\s*>`, "giu");
+  const invokeRe = new RegExp(`<${DSML_PREFIX}invoke\\s+name=["']([^"']+)["']\\s*>`, "giu");
 
   for (const match of body.matchAll(invokeRe)) {
     if (match.index === undefined) continue;
     const name = match[1]?.trim();
     if (!name) continue;
     const invokeBodyStart = match.index + match[0].length;
-    const close = findPattern(body, new RegExp(`</${prefix}invoke>`, "iu"), invokeBodyStart);
+    const close = findPattern(body, new RegExp(`</${DSML_PREFIX}invoke>`, "iu"), invokeBodyStart);
     if (!close) continue;
     const invokeBody = body.slice(invokeBodyStart, close.start);
     calls.push({ name, arguments: parseDsmlArguments(invokeBody), body: invokeBody });
@@ -419,9 +453,8 @@ function parseDsmlInvokes(body: string): Array<Omit<Candidate, "range" | "gramma
 
 function parseDsmlArguments(body: string): Record<string, unknown> {
   const args: Record<string, unknown> = {};
-  const prefix = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)";
   const paramRe = new RegExp(
-    `<${prefix}parameter\\s+name=["']([^"']+)["'](?:\\s+string=["'](true|false)["'])?\\s*>([\\s\\S]*?)</${prefix}parameter>`,
+    `<${DSML_PREFIX}parameter\\s+name=["']([^"']+)["'](?:\\s+string=["'](true|false)["'])?\\s*>([\\s\\S]*?)</${DSML_PREFIX}parameter>`,
     "giu",
   );
 
