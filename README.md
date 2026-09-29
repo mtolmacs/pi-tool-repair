@@ -169,6 +169,15 @@ Open models often leak their own shell vocabulary instead of pi's canonical tool
 
 Aliases apply before the `requireKnownTool` check, so an aliased call resolves against your active tools rather than the leaked name. If the alias target is not active, the markup is stripped but the call is not recovered. Argument keys `command`, `cmd`, `shell_command`, `script`, and `input` are normalized to `command`; a bare invoke body (for example `<...invoke name="command">pwd</...invoke>`) becomes the `command` value.
 
+DeepSeek V4.1 also emits *collapsed* calls where the invoke opener is lost entirely and the tool name rides in a bare `<parameter name="bash">` tag. Closer style varies because providers partially strip the DSML markers mid-stream (the same session can produce barred closers, plain closers, hybrid `</tool>` closers, or truncated blocks with no closer at all):
+
+```
+<parameter name="bash">cd /proj && ls testdata/</｜DSML｜ parameter>   <!-- barred closer -->
+<parameter name="bash">cd /proj && ls testdata/</parameter>           <!-- plain closer, zero bars -->
+```
+
+These are recovered the same way: the bare body becomes the `command` argument for bash and its aliases, and nested `<parameter name="tool">…children…</tool>` blocks parse their children into the argument object. Truncated copies without a closer are stripped (the opener is removed, the body stays as inert text) and never executed.
+
 Extend or override the map with `toolNameAliases`. Keys are matched case-insensitively:
 
 ```json

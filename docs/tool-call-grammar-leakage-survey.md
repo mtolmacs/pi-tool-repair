@@ -74,6 +74,14 @@ Three observed bar variants plus an ASCII-pipe variant from some proxies:
 < | DSML | parameter name="additionalContext" string="true">...</ | DSML | parameter>
 </ | DSML | invoke>
 </ | DSML | tool_calls>
+
+# Collapsed/conflated call (observed on DeepSeek V4.1): the invoke opener is
+# lost entirely and the call becomes a single prefix-less <parameter> tag
+# whose name attribute carries the tool name and whose body carries the only
+# argument, while the closer kept its DSML prefix. Truncated copies without
+# any closer also occur when the stream dies mid-retry.
+<parameter name="bash">cd /proj && ls testdata/</｜DSML｜ parameter>
+<parameter name="bash">cd /proj && ls testdata/   # truncated: no closer at all
 ```
 
 Key details:
@@ -82,6 +90,11 @@ Key details:
 - `string="true"` → value passed as-is; `string="false"` → value is JSON
   (number/bool/array/object). The repair must respect this when building args.
 - Inner body can be XML `<parameter>` tags **or** a direct JSON object.
+- Conflated single-tag calls: when the invoke opener is dropped, the call
+  collapses to a prefix-less `<parameter name="tool">body</｜DSML｜ parameter>`;
+  the DSML-prefixed closer is the only remaining DSML signal. Bare bodies on
+  command-runner tools (bash and alias targets) are recovered as the `command`
+  argument; truncated openers are stripped, never executed.
 - Newlines inside `<parameter>` values are common (multi-line bash) and break
   naive non-DOTALL matching — a real failure mode reported against pi itself
   (earendil-works/pi#3712).

@@ -314,6 +314,7 @@ function parseToolGrammarCandidates(text: string, enabled: Set<GrammarName>): Ca
   if (enabled.has("dsml")) {
     candidates.push(...parseDsml(text));
     candidates.push(...parseDsmlOpenerless(text));
+    candidates.push(...parseParameterCollapses(text));
     candidates.push(...parseDsmlDanglingMarkers(text));
   }
   if (enabled.has("kimi")) candidates.push(...parseKimi(text));
@@ -338,6 +339,15 @@ function parseToolGrammarCandidates(text: string, enabled: Set<GrammarName>): Ca
 // Shared DSML prefix: matches ｜DSML｜, ｜｜DSML｜｜, DSML｜, | DSML |,
 // and DeepSeek V4.1's spaced form (<｜DSML｜ parameter>) via the trailing \s*.
 const DSML_PREFIX = "(?:｜{1,2}DSML｜{1,2}|DSML｜|\\s*\\|\\s*DSML\\s*\\|\\s*)\\s*";
+
+// Providers partially strip the DSML markers mid-stream, so the same block
+// can mix barred and plain tags. Optional-prefix variants match both.
+const DSML_OPT_PREFIX = `(?:${DSML_PREFIX})?`;
+
+// Parameter child: optional DSML prefix, optional string attribute, value up
+// to the first matching closer (plain or DSML-prefixed).
+const PARAMETER_CHILD_SOURCE =
+  `<${DSML_OPT_PREFIX}parameter\\s+name=["']([^"']+)["'](?:\\s+string=["'](true|false)["'])?\\s*>([\\s\\S]*?)</${DSML_OPT_PREFIX}parameter>`;
 
 function parseDsml(text: string): Candidate[] {
   const candidates: Candidate[] = [];
@@ -391,6 +401,113 @@ function parseDsmlOpenerless(text: string): Candidate[] {
   }
 
   return candidates;
+}
+
+// Collapsed / partially de-markered parameter blocks. Providers mangle the
+// DSML stream inconsistently (observed on deepinfra deepseek-v4.1-flash):
+// the invoke opener and some of the fullwidth-bar markers get stripped,
+// leaving bare <parameter name="tool"> blocks whose closers may keep the
+// DSML prefix, close with a plain tag, close with </tool>, or vanish entirely
+// (truncated stream). Three shapes:
+//   collapsed:  <parameter name="bash">cd /tmp && ls</｜DSML｜ parameter>
+//   nested:     <parameter name="read"><parameter name="path">/f</parameter>...</read>
+//   truncated:  <parameter name="bash">cd /tmp && ls      (no closer at all)
+// Bare bodies become the `command` argument for command-runner tools in
+// normalizeCandidate; nested children become the argument object. Truncated
+// openers are stripped, never recovered.
+function parseParameterCollapses(text: string): Candidate[] {
+  const candidates: Candidate[] = [];
+  const openerRe = new RegExp(`<${DSML_OPT_PREFIX}parameter\\s+name=["']([^"']+)["'][^>]*>`, "gi");
+  const nestedAheadRe = new RegExp(`^\\s*<${DSML_OPT_PREFIX}parameter[\\s>]`, "i");
+  const nestedInsideRe = new RegExp(`<${DSML_OPT_PREFIX}parameter[\\s>]`, "i");
+
+  for (const match of text.matchAll(openerRe)) {
+    if (match.index === undefined || isInsideCodeFence(text, match.index)) continue;
+    const name = match[1]?.trim();
+    if (!name) continue;
+    const bodyStart = match.index + match[0].length;
+    const rest = text.slice(bodyStart);
+
+    // Nested form: parameter children directly follow the opener.
+    if (nestedAheadRe.test(rest)) {
+      const nested = parseNestedParameterCall(text, match.index, bodyStart, name);
+      candidates.push(nested);
+      continue;
+    }
+
+    const close =
+      findPattern(text, new RegExp(`</${DSML_OPT_PREFIX}parameter\\s*>`, "iu"), bodyStart) ??
+      findPattern(text, new RegExp(`</${DSML_OPT_PREFIX}${escapeRegExp(name)}\\s*>`, "iu"), bodyStart);
+    if (close) {
+      const body = text.slice(bodyStart, close.start);
+      if (nestedInsideRe.test(body)) {
+        // Children exist but not immediately after the opener: mangled
+        // fragment, strip the opener and let the other parsers handle the rest.
+        candidates.push(stripOnlyRange(match.index, bodyStart));
+        continue;
+      }
+      // The bare body is the single argument; argument construction from it
+      // happens in normalizeCandidate against the known tools.
+      candidates.push({
+        name,
+        arguments: {},
+        grammar: "dsml",
+        range: { start: match.index, end: close.end },
+        body,
+      });
+      continue;
+    }
+
+    // Truncated: no closer of any accepted kind. Strip the leaked opener;
+    // the body stays as inert text and is never executed.
+    candidates.push(stripOnlyRange(match.index, bodyStart));
+  }
+
+  return candidates;
+}
+
+function parseNestedParameterCall(text: string, start: number, bodyStart: number, name: string): Candidate {
+  const childRe = new RegExp(PARAMETER_CHILD_SOURCE, "gi");
+  const args: Record<string, unknown> = {};
+  let count = 0;
+  let cursor = bodyStart;
+
+  // Consecutive children (whitespace between them only) become the arguments.
+  for (;;) {
+    while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+    childRe.lastIndex = cursor;
+    const child = childRe.exec(text);
+    if (!child || child.index !== cursor) break;
+    const key = child[1]?.trim();
+    if (key) {
+      const raw = (child[3] ?? "").trim();
+      if (child[2] === "true") args[key] = raw;
+      else if (child[2] === "false") args[key] = parseJsonValueOrString(raw);
+      else args[key] = maybeParseJsonValue(raw);
+    }
+    cursor = child.index + child[0].length;
+    count++;
+  }
+
+  // Require an immediate block-end closer so truncated fragments stay text.
+  while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+  const endCloseRe = new RegExp(
+    `</${DSML_OPT_PREFIX}(?:parameter|invoke|calls|tool_calls|${escapeRegExp(name)})\\s*>`,
+    "iy",
+  );
+  endCloseRe.lastIndex = cursor;
+  if (count === 0 || !endCloseRe.exec(text)) {
+    return stripOnlyRange(start, bodyStart);
+  }
+  return { name, arguments: args, grammar: "dsml", range: { start, end: cursor + endCloseRe.lastIndex } };
+}
+
+function stripOnlyRange(start: number, end: number): Candidate {
+  return { name: "", arguments: {}, grammar: "dsml", range: { start, end }, stripOnly: true };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function parseDsmlDanglingMarkers(text: string): Candidate[] {
@@ -452,24 +569,28 @@ function parseDsmlInvokes(body: string): Array<Omit<Candidate, "range" | "gramma
 }
 
 function parseDsmlArguments(body: string): Record<string, unknown> {
-  const args: Record<string, unknown> = {};
-  const paramRe = new RegExp(
-    `<${DSML_PREFIX}parameter\\s+name=["']([^"']+)["'](?:\\s+string=["'](true|false)["'])?\\s*>([\\s\\S]*?)</${DSML_PREFIX}parameter>`,
-    "giu",
-  );
-
-  for (const match of body.matchAll(paramRe)) {
-    const key = match[1]?.trim();
-    if (!key) continue;
-    const stringAttr = match[2];
-    const rawValue = match[3] ?? "";
-    args[key] = stringAttr === "false" ? parseJsonValueOrString(rawValue.trim()) : rawValue;
-  }
-
+  const args = parseParameterChildArgs(body);
   if (Object.keys(args).length > 0) return args;
 
   const direct = parseJsonObject(extractFirstBalancedJson(body.trim())?.json ?? body.trim());
   return normalizeArgumentsObject(direct) ?? {};
+}
+
+// Unified parameter-children parser: accepts DSML-prefixed and plain tags in
+// any mix (providers partially strip the markers mid-stream). `string="true"`:
+// value passes through as-is; `string="false"`: JSON-parse or keep raw;
+// absent: JSON-parse values that look like numbers/bools/JSON, else raw.
+function parseParameterChildArgs(region: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  for (const match of region.matchAll(new RegExp(PARAMETER_CHILD_SOURCE, "gi"))) {
+    const key = match[1]?.trim();
+    if (!key) continue;
+    const raw = (match[3] ?? "").trim();
+    if (match[2] === "true") args[key] = raw;
+    else if (match[2] === "false") args[key] = parseJsonValueOrString(raw);
+    else args[key] = maybeParseJsonValue(raw);
+  }
+  return args;
 }
 
 function parseKimi(text: string): Candidate[] {
@@ -964,7 +1085,16 @@ function selectCandidates(candidates: Candidate[]): Candidate[] {
   for (const candidate of sorted) {
     const duplicate = selected.some((existing) => {
       const sameRange = existing.range.start === candidate.range.start && existing.range.end === candidate.range.end;
-      return !sameRange && rangesOverlap(existing.range, candidate.range);
+      if (sameRange) {
+        // Two parsers matching the exact same call: keep one.
+        return (
+          !existing.stripOnly &&
+          !candidate.stripOnly &&
+          existing.name === candidate.name &&
+          existing.grammar === candidate.grammar
+        );
+      }
+      return rangesOverlap(existing.range, candidate.range);
     });
     if (!duplicate) selected.push(candidate);
   }
@@ -992,13 +1122,35 @@ function resolveToolNameAlias(
   return knownTools.has(candidate) ? candidate : undefined;
 }
 
+// Tools that other leaked names alias TO (bash, or a configured alias target);
+// a bare body on such a call is interpreted as the shell command.
+function isCommandRunner(name: string, config: GrammarRepairConfig, knownTools: Set<string>): boolean {
+  if (!knownTools.has(name)) return false;
+  if (Object.values(TOOL_NAME_ALIASES).includes(name)) return true;
+  return Object.values(config.toolNameAliases ?? {}).includes(name);
+}
+
 function normalizeCandidate(
   candidate: Candidate,
   config: GrammarRepairConfig,
   knownTools: Set<string>,
 ): Candidate {
   const alias = resolveToolNameAlias(candidate.name, config, knownTools);
-  if (!alias) return candidate;
+
+  if (!alias) {
+    // Collapsed DSML calls carry the single argument as the bare tag body
+    // (e.g. `<parameter name="bash">cd /tmp</｜DSML｜ parameter>`); recover it
+    // as `command` when the name is already a canonical command runner.
+    const body = candidate.body?.trim();
+    if (
+      body &&
+      Object.keys(candidate.arguments).length === 0 &&
+      isCommandRunner(candidate.name, config, knownTools)
+    ) {
+      return { ...candidate, arguments: { command: body } };
+    }
+    return candidate;
+  }
 
   const args = candidate.arguments;
   if (args[COMMAND_ARGUMENT_KEY] !== undefined) {

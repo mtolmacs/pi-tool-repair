@@ -288,6 +288,212 @@ describe("DSML dangling marker stripping", () => {
   });
 });
 
+// DeepSeek V4.1 conflation: the invoke opener is lost entirely and the call
+// collapses into a single prefix-less <parameter name="tool"> tag whose body
+// carries the only argument, while the closer kept its DSML prefix:
+//   <parameter name="bash">cd /tmp && ls</｜DSML｜ parameter>
+describe("DSML conflated parameter calls (collapsed invoke)", () => {
+  const dsmlMsg = (text: string): MinimalAssistantMessage => ({
+    role: "assistant",
+    content: [{ type: "text", text }],
+    stopReason: "stop",
+  });
+
+  it("recovers a collapsed prefix-less parameter tag whose closer kept the DSML prefix", () => {
+    const command = "cd /Users/mtolmacs/Projects/dexilion-team/imgproxy && sed -n '1,80p' imagedata/image_data_test.go";
+    const text = `Checking the fixtures.\n\n<parameter name="bash">${command}</｜DSML｜ parameter>`;
+
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.changed).toBe(true);
+    expect(result.recoveredCalls).toEqual([
+      { grammar: "dsml", name: "bash", arguments: { command } },
+    ]);
+    expect(result.message.stopReason).toBe("toolUse");
+    expect(result.message.content).toContainEqual(
+      expect.objectContaining({ type: "toolCall", name: "bash", arguments: { command } }),
+    );
+    const stripped = (result.message.content[0] as { text: string }).text;
+    expect(stripped).not.toContain("DSML");
+    expect(stripped).not.toContain("<parameter");
+  });
+
+  it("recovers complete collapsed calls and strips a trailing truncated opener", () => {
+    const text = [
+      "<parameter name=\"bash\">cd /proj && ls testdata/test-images/jpg/ | head -30</｜DSML｜ parameter>",
+      "",
+      " <parameter name=\"bash\">cd /proj && ls testdata/test-images/png/</｜DSML｜ parameter>",
+      "",
+      " <parameter name=\"bash\">cd /proj && ls testdata/test-images/jpg/",
+    ].join("\n");
+
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([
+      { grammar: "dsml", name: "bash", arguments: { command: "cd /proj && ls testdata/test-images/jpg/ | head -30" } },
+      { grammar: "dsml", name: "bash", arguments: { command: "cd /proj && ls testdata/test-images/png/" } },
+    ]);
+    expect(result.message.stopReason).toBe("toolUse");
+    const stripped = (result.message.content[0] as { text: string }).text;
+    expect(stripped).not.toContain("DSML");
+    expect(stripped).not.toContain("<parameter");
+    // The truncated block's command stays as inert text, never executed.
+    expect(stripped).toContain("ls testdata/test-images/jpg/");
+  });
+
+  it("maps a collapsed alias-named call onto bash", () => {
+    const text = `<parameter name="command">git status --short</｜DSML｜ parameter>`;
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([
+      { grammar: "dsml", name: "bash", arguments: { command: "git status --short" } },
+    ]);
+  });
+
+  it("recovers a bare-body DSML invoke body as the command for bash", () => {
+    const text = `<｜DSML｜tool_calls>\n<｜DSML｜invoke name="bash">pwd</｜DSML｜invoke>\n</｜DSML｜tool_calls>`;
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([
+      { grammar: "dsml", name: "bash", arguments: { command: "pwd" } },
+    ]);
+    expect(result.message.stopReason).toBe("toolUse");
+  });
+
+  it("recovers the complete inner parameter of a truncated invoke fragment", () => {
+    // Outer invoke/bash opener is truncated (no invoke closer) so it is only
+    // stripped, but the inner name="command" child is itself complete and
+    // self-describing: a conflated call with the command as its body.
+    const text = `<parameter name="bash">\n<｜DSML｜ parameter name="command" string="true">cd /x && ls</｜DSML｜ parameter>`;
+
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([
+      { grammar: "dsml", name: "bash", arguments: { command: "cd /x && ls" } },
+    ]);
+    expect(result.message.stopReason).toBe("toolUse");
+    const stripped = (result.message.content[0] as { text: string }).text;
+    expect(stripped).not.toContain("DSML");
+    expect(stripped).not.toContain("<parameter");
+  });
+
+  it("strips a truncated prefix-less parameter opener even without DSML evidence", () => {
+    // deepinfra partially strips the DSML markers: the imgproxy session shows
+    // truncated plain openers in messages with zero fullwidth bars anywhere.
+    const text = "Let me look.\n<parameter name=\"bash\">cd /tmp && ls";
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+    expect(result.recoveredCalls).toEqual([]);
+    expect(result.changed).toBe(true);
+    const stripped = (result.message.content[0] as { text: string }).text;
+    expect(stripped).not.toContain("<parameter");
+    expect(stripped).toContain("cd /tmp && ls");
+  });
+
+  it("strips collapsed markers for non-command tools without recovering a call", () => {
+    const text = `before\n<parameter name="read">/etc/hosts</｜DSML｜ parameter>\nafter`;
+    const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["read", "bash"]));
+    expect(result.recoveredCalls).toEqual([]);
+    expect(result.changed).toBe(true);
+    const stripped = (result.message.content[0] as { text: string }).text;
+    expect(stripped).not.toContain("DSML");
+    expect(stripped).not.toContain("<parameter");
+    expect(stripped).toContain("before");
+    expect(stripped).toContain("after");
+  });
+
+  // Shapes observed verbatim in the imgproxy session JSONL (deepinfra
+  // deepseek-v4.1-flash): the provider partially strips the DSML markers, so
+  // the same message stream can produce fully-plain, hybrid, or mixed debris.
+  describe("partially de-markered debris (observed in session JSONL)", () => {
+    it("recovers a fully-plain collapsed block with no DSML markers anywhere", () => {
+      const text = `gofmt flags provider.go. Let me fix formatting.\n\n<parameter name="bash">cd /Users/mtolmacs/Projects/dexilion-team/imgproxy && gofmt -w info/provider.go</parameter>`;
+      const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+      expect(result.recoveredCalls).toEqual([
+        { grammar: "dsml", name: "bash", arguments: { command: "cd /Users/mtolmacs/Projects/dexilion-team/imgproxy && gofmt -w info/provider.go" } },
+      ]);
+      expect(result.message.stopReason).toBe("toolUse");
+      expect((result.message.content[0] as { text: string }).text).not.toContain("<parameter");
+    });
+
+    it("recovers a plain collapsed call next to a native toolCall without duplicating it", () => {
+      const message: MinimalAssistantMessage = {
+        role: "assistant",
+        content: [
+          { type: "text", text: `Working.\n\n<parameter name="bash">cd /proj && gofmt -l .</parameter>` },
+          { type: "toolCall", id: "native_1", name: "bash", arguments: { command: "cd /proj && gofmt -w ." } },
+        ],
+        stopReason: "toolUse",
+      };
+      const result = repairAssistantMessageGrammarLeaks(message, enabledConfig, new Set(["bash"]));
+      expect(result.recoveredCalls).toEqual([]);
+      expect(result.changed).toBe(true);
+      expect((result.message.content[0] as { text: string }).text).not.toContain("<parameter");
+      expect(result.message.content).toHaveLength(2);
+    });
+
+    it("strips an empty collapsed block without recovering it", () => {
+      const text = `<parameter name="bash">\n</parameter>`;
+      const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["bash"]));
+      expect(result.recoveredCalls).toEqual([]);
+      expect(result.changed).toBe(true);
+      expect((result.message.content[0] as { text: string }).text.trim()).toBe("");
+    });
+
+    it("recovers a nested multi-parameter block closed with a hybrid tool-name closer", () => {
+      // entry 204: <parameter name="read"> with plain children closed by </read>
+      const text = [
+        "I'll read the file.",
+        "",
+        "<parameter name=\"read\">",
+        "<parameter name=\"path\">/Users/mtolmacs/Projects/dexilion-team/imgproxy/handlers/stream/handler_test.go</parameter>",
+        "<parameter name=\"offset\">80</parameter>",
+        "<parameter name=\"limit\">140</parameter>",
+        "</read>",
+      ].join("\n");
+      const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["read"]));
+      expect(result.recoveredCalls).toEqual([
+        {
+          grammar: "dsml",
+          name: "read",
+          arguments: {
+            path: "/Users/mtolmacs/Projects/dexilion-team/imgproxy/handlers/stream/handler_test.go",
+            offset: 80,
+            limit: 140,
+          },
+        },
+      ]);
+      expect(result.message.stopReason).toBe("toolUse");
+    });
+
+    it("parses mixed barred/plain children into full arguments (garbage read regression)", () => {
+      // The old parser recovered read {"limit": "140"} with no path from this
+      // mixed-debris shape; all children must land in the argument object.
+      const text = [
+        "<parameter name=\"read\">",
+        "<parameter name=\"path\">/proj/handler_test.go</parameter>",
+        "<parameter name=\"offset\">80</parameter>",
+        "<｜DSML｜ parameter name=\"limit\" string=\"true\">140</｜DSML｜ parameter>",
+        "</｜DSML｜ invoke>",
+      ].join("\n");
+      const calls = parseToolGrammarLeaks(text, ["dsml"]);
+      expect(calls).toEqual([
+        {
+          grammar: "dsml",
+          name: "read",
+          arguments: { path: "/proj/handler_test.go", offset: 80, limit: "140" },
+        },
+      ]);
+    });
+
+    it("does not duplicate a recovered call when two parsers produce the same range", () => {
+      const text = [
+        "<parameter name=\"read\">",
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">/proj/a.go</｜DSML｜ parameter>",
+        "</｜DSML｜ invoke>",
+      ].join("\n");
+      const result = repairAssistantMessageGrammarLeaks(dsmlMsg(text), enabledConfig, new Set(["read"]));
+      expect(result.recoveredCalls).toEqual([
+        { grammar: "dsml", name: "read", arguments: { path: "/proj/a.go" } },
+      ]);
+    });
+  });
+});
+
 describe("assistant message grammar repair", () => {
   it("strips leaked text and appends a recovered toolCall", () => {
     const message: MinimalAssistantMessage = {
